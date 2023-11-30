@@ -1,0 +1,30 @@
+{
+  "canisters": {
+    "my_ai_backend": {
+      "candid": "src/my_ai_backend/my_ai_backend.did",
+      "package": "my_ai_backend",
+      "type": "rust"
+    },
+    "my_ai_frontend": {
+      "dependencies": [
+        "my_ai_backend"
+      ],
+      "frontend": {
+        "entrypoint": "src/my_ai_frontend/src/index.html"
+      },
+      "source": [
+        "src/my_ai_frontend/assets",
+        "dist/my_ai_frontend/"
+      ],
+      "type": "assets"
+    }
+  },
+  "defaults": {
+    "build": {
+      "args": "",
+      "packtool": ""
+    }
+  },
+  "output_env_file": ".env",
+  "version": 1
+}
