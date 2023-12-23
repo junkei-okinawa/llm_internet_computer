@@ -17,6 +17,14 @@ ic-cdk-timers = "0.6.0"
 ic-stable-structures = "0.6.0"
 serde = "1.0.193"
 sha2 = "0.10.8"
+candle = { package = "candle-core", path = "/Users/junkei/Documents/candle/candle-core" }
+# candle = { package = "candle-core", git = "https://github.com/junkei-okinawa/candle.git", branch = "feature/config_new_for_mixformer" }
+candle-nn = { git = "https://github.com/junkei-okinawa/candle.git", branch = "feature/config_new_for_mixformer" }
+candle-transformers = { git = "https://github.com/junkei-okinawa/candle.git", branch = "feature/config_new_for_mixformer" }
+tokenizers = { version = "0.13.4", default-features = false, features = [
+  "unstable_wasm",
+] }
+
 # [dependencies]
 # candid = "0.8.2"
 # ic-cdk = "0.6.0"

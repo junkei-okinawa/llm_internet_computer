@@ -1,4 +1,6 @@
+import { Null } from "@dfinity/candid/lib/cjs/idl";
 import { my_ai_backend } from "../../declarations/my_ai_backend";
+import { OptionForm } from "@dfinity/candid";
 
 document.querySelector("form").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -20,7 +22,6 @@ document.querySelector("form").addEventListener("submit", async (e) => {
 
 let file;
 let content_type;
-// let fileArrayBuffer;
 
 const input = document.querySelector("section#file>input");
 input?.addEventListener("change", (e) => {
@@ -29,6 +30,8 @@ input?.addEventListener("change", (e) => {
     content_type = "weight";
   } else if (file.name === "tokenizer.json") {
     content_type = "tokenizer";
+  } else if (file.name.indexOf("config.json") !== -1) {
+    content_type = "config";
   } else {
     alert("Please select a valid file");
     file = undefined;
@@ -51,35 +54,7 @@ const uploadChunk = async ({ counter, currentSize, model_name, content_type, chu
   );
 }
 
-const asyncCommitBatch = async (model_name, content_type, ids) => {
-  console.log("call commit_batch. ids.length: ", ids.length);
-  return my_ai_backend.commit_batch(
-    model_name,
-    content_type,
-    ids,
-  );
-}
-
-const wait = async (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-const upload = async () => {
-  if (!file) {
-    alert("Please select a file");
-    return;
-  }
-
-  if (!content_type) {
-    alert("Please select a file");
-    return;
-  }
-
-  const model_name = document.querySelector("input#model").value.toString();
-  if (!model_name) {
-    alert("Please input a model name");
-    return;
-  }
-
-  console.log("start upload");
+const chunkUploader = async (model_name) => {
 
   const chunkSize = 1024 * 1024 * 1.9; // 1.9MB
   const splitCount = 100;
@@ -143,6 +118,53 @@ const upload = async () => {
   console.log("file uploaded");
   console.log("result: ", result);
   content_type = null;
+}
+
+const configUploader = async () => {
+  const fileReader = new FileReader();
+  fileReader.readAsText(file, "UTF-8");
+  fileReader.onload = (e) => {
+    const config = JSON.parse(e.target.result);
+    if (config.layer_norm_epsilon) {
+      config.layer_norm_epsilon = String(config.layer_norm_epsilon)
+    }
+    if (!config.pad_vocab_size_multiple) {
+      config.pad_vocab_size_multiple = 64;
+    }
+    console.log("config: ", config);
+    const model_name = document.querySelector("input#model").value.toString();
+    my_ai_backend.init_llm_config(model_name, config);
+    file = null;
+    console.log("config uploaded");
+  }
+}
+
+const upload = async () => {
+  if (!file) {
+    alert("Please select a file");
+    return;
+  }
+
+  if (!content_type) {
+    alert("Please select a file");
+    return;
+  }
+
+  const model_name = document.querySelector("input#model").value.toString();
+  if (!model_name) {
+    alert("Please input a model name");
+    return;
+  }
+
+  console.log("start upload");
+
+  if (content_type === "config") {
+    console.log("start configUploader.");
+    await configUploader();
+  } else {
+    console.log("start chunkUploader.");
+    await chunkUploader(model_name);
+  }
 }
 
 const buttonUpload = document.querySelector("button.upload");
