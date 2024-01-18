@@ -1,1084 +1,601 @@
-use candid::{CandidType, Decode, Encode};
-use ic_cdk_macros::{export_candid, post_upgrade, pre_upgrade, query, update};
-use ic_stable_structures::storable::Bound;
-use ic_stable_structures::{writer::Writer, Memory as _, StableBTreeMap, Storable};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::{
-    borrow::Cow,
-    cell::RefCell,
-    cmp::{Eq, Ord, PartialEq, PartialOrd},
+//! This module declares canister methods expected by the assets canister client.
+use ic_cdk_macros::{export_candid, init, post_upgrade, pre_upgrade, query, update};
+use itertools::Itertools;
+use num_traits::ToPrimitive;
+pub mod asset_certification;
+pub mod evidence;
+pub mod state_machine;
+pub mod types;
+mod url_decode;
+
+pub use crate::state_machine::StableState;
+use crate::{
+    asset_certification::types::http::{
+        CallbackFunc, HttpRequest, HttpResponse, StreamingCallbackHttpResponse,
+        StreamingCallbackToken,
+    },
+    state_machine::{AssetDetails, CertifiedTree, EncodedAsset, State},
+    types::*,
 };
-mod memory;
-use memory::Memory;
+use asset_certification::types::{certification::AssetKey, rc_bytes::RcBytes};
+use candid::Principal;
+use ic_cdk::api::{call::ManualReply, caller, data_certificate, set_certified_data, time, trap};
+use serde_bytes::ByteBuf;
+use std::{cell::RefCell, ops::Deref, str::FromStr};
 
-// use candle_transformers::models::mixformer::{Config, MixFormerSequentialForCausalLM as MixFormer};
-// use candle_transformers::models::quantized_mixformer::MixFormerSequentialForCausalLM as QMixFormer;
+mod llm;
+use anyhow::{Error, Result};
+use candle::{DType, Device, Tensor};
+use candle_nn::{Activation, VarBuilder};
+use candle_transformers::generation::LogitsProcessor;
+use candle_transformers::models::mixformer::{Config, MixFormerSequentialForCausalLM as MixFormer};
+use candle_transformers::models::quantized_mixformer::MixFormerSequentialForCausalLM as QMixFormer;
+use tokenizers::Tokenizer;
 
-// use candle::{DType, Device, Tensor};
-// use candle_nn::{Activation, VarBuilder};
-// use candle_transformers::generation::LogitsProcessor;
-// use tokenizers::Tokenizer;
-
-const MAX_SIZE_LLM: u32 = u32::MAX; // 4GB
-const MAX_COUNT_PAT: u32 = 10;
-
-#[derive(Eq, Ord, PartialEq, PartialOrd, CandidType, Deserialize, Debug, Clone)]
-struct LLM {
-    model_name: String,
-    weight: Option<Vec<u8>>,
-    tokenizer: Option<Vec<u8>>,
-    config: Option<ConfigData>,
-}
-
-#[derive(Eq, Ord, PartialEq, PartialOrd, CandidType, Deserialize, Debug, Clone)]
-struct ConfigData {
-    pub vocab_size: usize,
-    pub n_positions: usize,
-    pub n_embd: usize,
-    pub n_layer: usize,
-    pub n_inner: Option<usize>,
-    pub n_head: usize,
-    pub rotary_dim: usize,
-    pub activation_function: String,
-    pub layer_norm_epsilon: String,
-    pub tie_word_embeddings: bool,
-    pub pad_vocab_size_multiple: usize,
-}
-
-// #[derive(Deserialize)]
-// struct CustomConfigStruct(Config);
-
-// pub trait CustomConfigTrait {
-//     fn from_file(file_config: ConfigData) -> Self;
-// }
-
-// impl CustomConfigTrait for Config {
-//     fn from_file(data: ConfigData) -> Self {
-//         let layer_norm_epsilon = data.layer_norm_epsilon.parse::<f64>().unwrap();
-//         let activation_function = match data.activation_function.as_str() {
-//             "gelu" => Activation::Gelu,
-//             "new_gelu" => Activation::NewGelu,
-//             "relu" => Activation::Relu,
-//             "relu2" => Activation::Relu2,
-//             "relu6" => Activation::Relu6,
-//             "silu" => Activation::Silu,
-//             "sigmoid" => Activation::Sigmoid,
-//             "hard_sigmoid" => Activation::HardSigmoid,
-//             "swiglu" => Activation::Swiglu,
-//             "swish" => Activation::Swish,
-//             "hard_swish" => Activation::HardSwish,
-//             "elu" => Activation::Elu(layer_norm_epsilon),
-//             "leaky_relu" => Activation::LeakyRelu(layer_norm_epsilon),
-//             _ => Activation::NewGelu,
-//         };
-
-//         // data key contains "pad_vocab_size_multiple"?
-//         let pad_vocab_size_multiple = match data.pad_vocab_size_multiple {
-//             None => 64,
-//             Some(pad_vocab_size_multiple) => pad_vocab_size_multiple,
-//         };
-
-//         Config::new(
-//             data.vocab_size,
-//             data.n_positions,
-//             data.n_embd,
-//             data.n_layer,
-//             data.n_inner,
-//             data.n_head,
-//             data.rotary_dim,
-//             activation_function,
-//             layer_norm_epsilon,
-//             data.tie_word_embeddings,
-//             pad_vocab_size_multiple,
-//         )
-//     }
-// }
-
-#[update]
-fn init_llm_config(model_name: String, config: ConfigData) -> Option<String> {
-    let llm = match exist_llm(model_name.clone()) {
-        true => {
-            let llm_result = STATE.with(|s| s.borrow().stable_data.get(&model_name));
-            let llm = match llm_result {
-                Some(llm) => llm,
-                None => return None,
-            };
-            StableBTreeMapLLM(LLM {
-                model_name: llm.0.model_name.clone(),
-                weight: llm.0.weight.clone(),
-                tokenizer: llm.0.tokenizer.clone(),
-                config: Some(config),
-            })
-        }
-        false => StableBTreeMapLLM(LLM {
-            model_name: model_name.clone(),
-            weight: None,
-            tokenizer: None,
-            config: Some(config),
-        }),
-    };
-    insert_llm(model_name.clone(), llm);
-    Some(model_name)
-}
-
-#[derive(CandidType, Ord, PartialOrd, Eq, PartialEq, Debug, Clone, Deserialize)]
-struct StableBTreeMapLLM(LLM);
-
-impl Storable for StableBTreeMapLLM {
-    fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
-        Cow::Owned(Encode!(self).unwrap())
-    }
-    fn from_bytes(bytes: Cow<'_, [u8]>) -> Self {
-        Decode!(&bytes, Self).unwrap()
-    }
-    const BOUND: Bound = Bound::Bounded {
-        max_size: MAX_SIZE_LLM,
-        is_fixed_size: false,
-    };
-}
-
-// #[derive(Serialize, Deserialize, Clone, CandidType)]
-// struct TmpData {
-//     data: BTreeMap<String, TmpChunks>, // key: model_name & "_" & content_type
-// }
-
-#[derive(Serialize, Deserialize, Clone, CandidType)]
-struct TmpChunks {
-    chunks: HashMap<u32, Vec<u8>>, // key: chunk_id & value: chunk
-    data_name: String,
-    content_type: ContentType,
-}
-
-#[derive(Serialize, Deserialize, Clone, CandidType)]
-enum ContentType {
-    Weight,
-    Tokenizer,
-}
-
-#[derive(Serialize, Deserialize, Clone, CandidType)]
-pub enum CountPat {
-    Pat0,
-    Pat1,
-    Pat2,
-    Pat3,
-    Pat4,
-    Pat5,
-    Pat6,
-    Pat7,
-    Pat8,
-    Pat9,
-}
-
-// The state of the canister.
-#[derive(Serialize, Deserialize)]
-struct State {
-    // Data that lives on the heap.
-    // This is an example for data that would need to be serialized/deserialized
-    // on every upgrade for it to be persisted.
-    data_on_the_heap: Vec<u8>,
-
-    // An example `StableBTreeMap`. Data stored in `StableBTreeMap` doesn't need to
-    // be serialized/deserialized in upgrades, so we tell serde to skip it.
-    #[serde(skip, default = "init_stable_data")]
-    stable_data: StableBTreeMap<String, StableBTreeMapLLM, Memory>,
-    tmp_data0: BTreeMap<String, TmpChunks>,
-    tmp_data1: BTreeMap<String, TmpChunks>,
-    tmp_data2: BTreeMap<String, TmpChunks>,
-    tmp_data3: BTreeMap<String, TmpChunks>,
-    tmp_data4: BTreeMap<String, TmpChunks>,
-    tmp_data5: BTreeMap<String, TmpChunks>,
-    tmp_data6: BTreeMap<String, TmpChunks>,
-    tmp_data7: BTreeMap<String, TmpChunks>,
-    tmp_data8: BTreeMap<String, TmpChunks>,
-    tmp_data9: BTreeMap<String, TmpChunks>,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            data_on_the_heap: vec![],
-            stable_data: init_stable_data(),
-            tmp_data0: BTreeMap::new(),
-            tmp_data1: BTreeMap::new(),
-            tmp_data2: BTreeMap::new(),
-            tmp_data3: BTreeMap::new(),
-            tmp_data4: BTreeMap::new(),
-            tmp_data5: BTreeMap::new(),
-            tmp_data6: BTreeMap::new(),
-            tmp_data7: BTreeMap::new(),
-            tmp_data8: BTreeMap::new(),
-            tmp_data9: BTreeMap::new(),
-        }
-    }
-}
+#[cfg(target_arch = "wasm32")]
+#[link_section = "icp:public supported_certificate_versions"]
+pub static SUPPORTED_CERTIFICATE_VERSIONS: [u8; 3] = *b"1,2";
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
 }
 
-fn get_count_pat(id: u32) -> CountPat {
-    match id % 10 {
-        0 => CountPat::Pat0,
-        1 => CountPat::Pat1,
-        2 => CountPat::Pat2,
-        3 => CountPat::Pat3,
-        4 => CountPat::Pat4,
-        5 => CountPat::Pat5,
-        6 => CountPat::Pat6,
-        7 => CountPat::Pat7,
-        8 => CountPat::Pat8,
-        9 => CountPat::Pat9,
-        _ => panic!("Invalid memory id"),
-    }
-}
-
-fn exist_tmp_data(count_pat: CountPat, model_name: String, content_type: String) -> bool {
-    match count_pat {
-        CountPat::Pat0 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data0
-                .contains_key(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat1 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data1
-                .contains_key(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat2 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data2
-                .contains_key(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat3 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data3
-                .contains_key(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat4 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data4
-                .contains_key(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat5 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data5
-                .contains_key(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat6 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data6
-                .contains_key(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat7 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data7
-                .contains_key(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat8 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data8
-                .contains_key(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat9 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data9
-                .contains_key(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-    }
-}
-
-fn exist_temp_chunk(
-    count_pat: CountPat,
-    model_name: String,
-    content_type: String,
-    chunk_id: u32,
-) -> bool {
-    match count_pat {
-        CountPat::Pat0 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data0
-                .get(&(model_name.clone() + "_" + &content_type.clone()))
-                .unwrap()
-                .chunks
-                .contains_key(&chunk_id)
-        }),
-        CountPat::Pat1 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data1
-                .get(&(model_name.clone() + "_" + &content_type.clone()))
-                .unwrap()
-                .chunks
-                .contains_key(&chunk_id)
-        }),
-        CountPat::Pat2 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data2
-                .get(&(model_name.clone() + "_" + &content_type.clone()))
-                .unwrap()
-                .chunks
-                .contains_key(&chunk_id)
-        }),
-        CountPat::Pat3 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data3
-                .get(&(model_name.clone() + "_" + &content_type.clone()))
-                .unwrap()
-                .chunks
-                .contains_key(&chunk_id)
-        }),
-        CountPat::Pat4 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data4
-                .get(&(model_name.clone() + "_" + &content_type.clone()))
-                .unwrap()
-                .chunks
-                .contains_key(&chunk_id)
-        }),
-        CountPat::Pat5 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data5
-                .get(&(model_name.clone() + "_" + &content_type.clone()))
-                .unwrap()
-                .chunks
-                .contains_key(&chunk_id)
-        }),
-        CountPat::Pat6 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data6
-                .get(&(model_name.clone() + "_" + &content_type.clone()))
-                .unwrap()
-                .chunks
-                .contains_key(&chunk_id)
-        }),
-        CountPat::Pat7 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data7
-                .get(&(model_name.clone() + "_" + &content_type.clone()))
-                .unwrap()
-                .chunks
-                .contains_key(&chunk_id)
-        }),
-        CountPat::Pat8 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data8
-                .get(&(model_name.clone() + "_" + &content_type.clone()))
-                .unwrap()
-                .chunks
-                .contains_key(&chunk_id)
-        }),
-        CountPat::Pat9 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data9
-                .get(&(model_name.clone() + "_" + &content_type.clone()))
-                .unwrap()
-                .chunks
-                .contains_key(&chunk_id)
-        }),
-    }
-}
-
-fn insert_tmp_chunks(
-    count_pat: CountPat,
-    model_name: String,
-    content_type: String,
-    tmp_chunks: TmpChunks,
-) {
-    let key = model_name.clone() + "_" + &content_type.clone();
-    match count_pat {
-        CountPat::Pat0 => STATE.with(|s| s.borrow_mut().tmp_data0.insert(key, tmp_chunks)),
-        CountPat::Pat1 => STATE.with(|s| s.borrow_mut().tmp_data1.insert(key, tmp_chunks)),
-        CountPat::Pat2 => STATE.with(|s| s.borrow_mut().tmp_data2.insert(key, tmp_chunks)),
-        CountPat::Pat3 => STATE.with(|s| s.borrow_mut().tmp_data3.insert(key, tmp_chunks)),
-        CountPat::Pat4 => STATE.with(|s| s.borrow_mut().tmp_data4.insert(key, tmp_chunks)),
-        CountPat::Pat5 => STATE.with(|s| s.borrow_mut().tmp_data5.insert(key, tmp_chunks)),
-        CountPat::Pat6 => STATE.with(|s| s.borrow_mut().tmp_data6.insert(key, tmp_chunks)),
-        CountPat::Pat7 => STATE.with(|s| s.borrow_mut().tmp_data7.insert(key, tmp_chunks)),
-        CountPat::Pat8 => STATE.with(|s| s.borrow_mut().tmp_data8.insert(key, tmp_chunks)),
-        CountPat::Pat9 => STATE.with(|s| s.borrow_mut().tmp_data9.insert(key, tmp_chunks)),
-    };
-}
-
-fn update_chunks(
-    count_pat: CountPat,
-    model_name: String,
-    content_type: String,
-    chunk_id: u32,
-    chunk: Vec<u8>,
-) {
-    let key = model_name.clone() + "_" + &content_type.clone();
-    match count_pat {
-        CountPat::Pat0 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data0
-                .get_mut(&key)
-                .unwrap()
-                .chunks
-                .insert(chunk_id, chunk.clone())
-        }),
-        CountPat::Pat1 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data1
-                .get_mut(&key)
-                .unwrap()
-                .chunks
-                .insert(chunk_id, chunk.clone())
-        }),
-        CountPat::Pat2 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data2
-                .get_mut(&key)
-                .unwrap()
-                .chunks
-                .insert(chunk_id, chunk.clone())
-        }),
-        CountPat::Pat3 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data3
-                .get_mut(&key)
-                .unwrap()
-                .chunks
-                .insert(chunk_id, chunk.clone())
-        }),
-        CountPat::Pat4 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data4
-                .get_mut(&key)
-                .unwrap()
-                .chunks
-                .insert(chunk_id, chunk.clone())
-        }),
-        CountPat::Pat5 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data5
-                .get_mut(&key)
-                .unwrap()
-                .chunks
-                .insert(chunk_id, chunk.clone())
-        }),
-        CountPat::Pat6 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data6
-                .get_mut(&key)
-                .unwrap()
-                .chunks
-                .insert(chunk_id, chunk.clone())
-        }),
-        CountPat::Pat7 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data7
-                .get_mut(&key)
-                .unwrap()
-                .chunks
-                .insert(chunk_id, chunk.clone())
-        }),
-        CountPat::Pat8 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data8
-                .get_mut(&key)
-                .unwrap()
-                .chunks
-                .insert(chunk_id, chunk.clone())
-        }),
-        CountPat::Pat9 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data9
-                .get_mut(&key)
-                .unwrap()
-                .chunks
-                .insert(chunk_id, chunk.clone())
-        }),
-    };
-}
-
-fn get_tmp_chunk(
-    count_pat: CountPat,
-    model_name: String,
-    content_type: String,
-    chunk_id: u32,
-) -> Vec<u8> {
-    let key = model_name.clone() + "_" + &content_type.clone();
-    match count_pat {
-        CountPat::Pat0 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data0
-                .get(&key)
-                .unwrap()
-                .chunks
-                .get(&chunk_id)
-                .unwrap()
-                .clone()
-        }),
-        CountPat::Pat1 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data1
-                .get(&key)
-                .unwrap()
-                .chunks
-                .get(&chunk_id)
-                .unwrap()
-                .clone()
-        }),
-        CountPat::Pat2 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data2
-                .get(&key)
-                .unwrap()
-                .chunks
-                .get(&chunk_id)
-                .unwrap()
-                .clone()
-        }),
-        CountPat::Pat3 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data3
-                .get(&key)
-                .unwrap()
-                .chunks
-                .get(&chunk_id)
-                .unwrap()
-                .clone()
-        }),
-        CountPat::Pat4 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data4
-                .get(&key)
-                .unwrap()
-                .chunks
-                .get(&chunk_id)
-                .unwrap()
-                .clone()
-        }),
-        CountPat::Pat5 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data5
-                .get(&key)
-                .unwrap()
-                .chunks
-                .get(&chunk_id)
-                .unwrap()
-                .clone()
-        }),
-        CountPat::Pat6 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data6
-                .get(&key)
-                .unwrap()
-                .chunks
-                .get(&chunk_id)
-                .unwrap()
-                .clone()
-        }),
-        CountPat::Pat7 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data7
-                .get(&key)
-                .unwrap()
-                .chunks
-                .get(&chunk_id)
-                .unwrap()
-                .clone()
-        }),
-        CountPat::Pat8 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data8
-                .get(&key)
-                .unwrap()
-                .chunks
-                .get(&chunk_id)
-                .unwrap()
-                .clone()
-        }),
-        CountPat::Pat9 => STATE.with(|s| {
-            s.borrow()
-                .tmp_data9
-                .get(&key)
-                .unwrap()
-                .chunks
-                .get(&chunk_id)
-                .unwrap()
-                .clone()
-        }),
-    }
+#[update]
+fn set_model_content(arg: SetModelContentArguments) -> Result<SetModelContentResponse, String> {
+    STATE.with(|s| s.borrow_mut().set_model_content(arg))
 }
 
 #[update]
-pub async fn create_chunk(
-    model_name: String,
-    content_type: String,
-    chunk: Vec<u8>,
-    counter: u32,
-) -> Result<u32, String> {
-    ic_cdk::println!("Chunk Len: {:?}", chunk.len());
-    let count_pat = get_count_pat(counter);
+fn load_config(arg: GetArg) {
+    ic_cdk::println!("called load_config");
+    let get_result = STATE.with(|s| s.borrow_mut().get_model_content(&arg.key));
 
-    if !exist_tmp_data(count_pat.clone(), model_name.clone(), content_type.clone()) {
-        let mut tmp_chunks = TmpChunks {
-            chunks: HashMap::new(),
-            data_name: model_name.clone(),
-            content_type: match content_type.as_str() {
-                "weight" => ContentType::Weight,
-                "tokenizer" => ContentType::Tokenizer,
-                _ => return Err("Data type is not set".to_string()),
-            },
-        };
-        tmp_chunks.chunks.insert(counter, chunk);
-        insert_tmp_chunks(
-            count_pat,
-            model_name.clone(),
-            content_type.clone(),
-            tmp_chunks,
-        );
-    } else {
-        update_chunks(count_pat, model_name, content_type, counter, chunk);
-    }
-    ic_cdk::println!("Chunk ID: {:?}", counter);
-    Ok(counter)
+    let config: Config = match get_result {
+        Ok(content) => {
+            ic_cdk::println!("content: {:?}", content);
+            llm::CustomConfigTrait::from_slice(&content)
+        }
+        Err(e) => {
+            ic_cdk::println!("error: {:?}", e);
+            trap(&e.to_string());
+        }
+    };
+
+    ic_cdk::println!("config: {:?}", config);
 }
+fn get_asset_content(arg: GetArg) -> Result<String, String> {
+    let encoded_asset = get(arg.clone());
+    let total_length = encoded_asset.total_length.0;
+    let content_length = candid::Nat::from(encoded_asset.content.len()).0;
+    let size_ceil = num_integer::div_ceil(total_length, content_length) - candid::Nat::from(1u32).0;
+    let from_utf8_result = String::from_utf8_lossy(encoded_asset.content.as_ref());
+    let mut content = from_utf8_result.to_string();
+    for index in 0..size_ceil.to_usize().unwrap() {
+        ic_cdk::println!("index: {:?}", index);
+        let get_chunk_arg = GetChunkArg {
+            key: arg.key.clone(),
+            content_encoding: arg.accept_encodings[0].clone(),
+            index: candid::Nat::from(index + 1),
+            sha256: encoded_asset.sha256.clone(),
+        };
+        let chunk_response = get_chunk(get_chunk_arg);
+        content += String::from_utf8_lossy(chunk_response.content.as_ref())
+            .to_string()
+            .as_str();
+    }
+    Ok(content)
+}
+#[update]
+fn load_tokenizer(arg: GetArg) {
+    ic_cdk::println!("call load_tokenizer");
+    let get_result = STATE.with(|s| s.borrow_mut().get_model_content(&arg.key));
+    let content = match get_result {
+        Ok(content) => content,
+        Err(e) => {
+            ic_cdk::println!("error: {:?}", e);
+            trap(&e.to_string());
+        }
+    };
+
+    let tokenizer_result = Tokenizer::from_bytes(content);
+    match tokenizer_result {
+        Ok(tokenizer) => {
+            ic_cdk::println!("loaded tokenizer.");
+            ic_cdk::println!("tokenizer: {:?}", tokenizer)
+        }
+        Err(e) => {
+            ic_cdk::println!("error: {:?}", e);
+        }
+    };
+}
+
+// #[query]
+// fn load_model(arg: GetArg) {
+//     ic_cdk::println!("call load_model");
+//     let get_result = STATE.with(|s| s.borrow().get_model_content(arg.key));
+
+//     match get_result {
+//         Ok(weights) => {
+//             ic_cdk::println!("Ok(content)");
+//             let device = &Device::Cpu;
+//             ic_cdk::println!("device: {:?}", device);
+//             ic_cdk::println!("weights.len(): {:?}", weights.len());
+//             let vb_result =
+//                 VarBuilder::from_buffered_safetensors(weights.into_bytes(), DType::F32, device);
+//             let vb = match vb_result {
+//                 Ok(vb) => vb,
+//                 Err(e) => {
+//                     ic_cdk::println!("error: {:?}", e);
+//                     trap(&e.to_string());
+//                 }
+//             };
+//             ic_cdk::println!("loaded vb");
+//             // let mixformer = MixFormer::new(&config, vb).unwrap();
+//             // ic_cdk::println!("mixformer: {:?}", mixformer);
+//             // let model = llm::SelectedModel::MixFormer(mixformer);
+//             // ic_cdk::println!("model: {:?}", model);
+//             // ic_cdk::api::print(format!("loaded the model"));
+//             // let seed: u64 = 299792458;
+//             // let logits_processor = LogitsProcessor::new(seed, None, None);
+//             // ic_cdk::println!("loaded logits_processor.");
+//             // let loaded_model = llm::Model {
+//             //     model,
+//             //     tokenizer,
+//             //     logits_processor,
+//             //     tokens: vec![],
+//             //     repeat_penalty: 1.,
+//             //     repeat_last_n: 64,
+//             // };
+//             // ic_cdk::println!("loaded_model: {:?}", loaded_model);
+//         }
+//         Err(e) => {
+//             ic_cdk::println!("error: {:?}", e);
+//         }
+//     }
+// }
 
 #[update]
-pub async fn commit_batch(
-    model_name: String,
-    content_type: String,
-    mut chunk_ids: Vec<u32>,
-) -> Result<String, String> {
-    ic_cdk::println!("called commit_batch. Chunk IDs: {:?}", chunk_ids);
+fn load_gguf(arg: GetArg) {
+    ic_cdk::println!("call load_gguf");
+    let vb_result = STATE.with(|s| {
+        // let weights = model_content.content.clone();
+        // ic_cdk::println!("weights.len(): {:?}", &model_content.content);
+        candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
+            &s.borrow()
+                .model_store
+                .get(&arg.key)
+                .unwrap_or_else(|| trap(&format!("No model found for key {}", arg.key.to_string())))
+                .content,
+        )
+    });
 
-    if exist_llm(model_name.clone()) {
-        ic_cdk::println!("exist llm. model_name: {:?}", model_name);
-        ic_cdk::println!(
-            "init llm content. model_name: {:?}, content_type: {:?}",
-            model_name,
-            content_type
-        );
-        let _ = match content_type.as_str() {
-            "weight" => update_llm_weight(model_name.clone(), Some(vec![])),
-            "tokenizer" => update_llm_tokenizer(model_name.clone(), Some(vec![])),
-            _ => return Err("Data type is not set".to_string()),
-        };
-    } else {
-        ic_cdk::println!("create llm. content_type: {:?}", content_type);
-        let llm = match content_type.as_str() {
-            "weight" => StableBTreeMapLLM(LLM {
-                model_name: model_name.clone(),
-                weight: Some(vec![]),
-                tokenizer: None,
-                config: None,
-            }),
-            "tokenizer" => StableBTreeMapLLM(LLM {
-                model_name: model_name.clone(),
-                weight: None,
-                tokenizer: Some(vec![]),
-                config: None,
-            }),
-            _ => return Err("Data type is not set".to_string()),
-        };
-        insert_llm(model_name.clone(), llm);
+    // let weights = match get_result {
+    //     Ok(chunks) => chunks,
+    //     Err(e) => {
+    //         ic_cdk::println!("error: {:?}", e);
+    //         trap(&e.to_string());
+    //     }
+    // };
+
+    // ic_cdk::println!("weights.len(): {:?}", weights.len());
+
+    // let vb_result =
+    //     candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(&weights);
+
+    let vb = match vb_result {
+        Ok(vb) => vb,
+        Err(e) => {
+            ic_cdk::println!("error: {:?}", e);
+            trap(&e.to_string());
+        }
     };
 
-    ic_cdk::println!("start!!! update llm content.");
-    chunk_ids.sort();
-    let last = chunk_ids.last().unwrap();
-    let mut chunks = vec![];
-    for chunk_id in chunk_ids.clone() {
-        let count_pat = get_count_pat(chunk_id.clone());
+    ic_cdk::println!("loaded vb");
+    let config_arg = GetArg {
+        key: "/config.json".to_string(),
+        accept_encodings: vec!["identity".to_string()],
+    };
+    let asset_config = get(config_arg);
+    ic_cdk::println!("asset_config: {:?}", asset_config);
 
-        if !exist_tmp_data(
-            get_count_pat(chunk_id),
-            model_name.clone(),
-            content_type.clone(),
-        ) {
-            return Err("Chunk id does not exist".to_string());
-        }
+    let config: Config = llm::CustomConfigTrait::from_slice(&asset_config.content);
 
-        if !exist_temp_chunk(
-            count_pat.clone(),
-            model_name.clone(),
-            content_type.clone(),
-            chunk_id,
-        ) {
-            return Err("Chunk id does not exist".to_string());
-        }
+    ic_cdk::println!("config: {:?}", config);
+    // let mixformer_result = QMixFormer::new(&config, vb);
+    // ic_cdk::println!("mixformer_result: {:?}", mixformer_result);
 
-        let chunk = get_tmp_chunk(
-            count_pat.clone(),
-            model_name.clone(),
-            content_type.clone(),
-            chunk_id,
-        );
+    // let model = match mixformer_result {
+    //     Ok(m) => llm::SelectedModel::Quantized(m),
+    //     Err(e) => {
+    //         ic_cdk::println!("error: {:?}", e);
+    //         trap(&e.to_string());
+    //     }
+    // };
 
-        ic_cdk::println!("geted tmp chunk. chunk id: {:?}", chunk_id);
-
-        chunks.extend(chunk);
-        ic_cdk::println!("chunks.len(): {:?}", chunks.len());
-        if chunk_id % 10 == 0 || chunk_id == *last {
-            // chunks は 可変参照渡しとし、メモリリークを防ぐ
-            let extend_result = match content_type.as_str() {
-                "weight" => extend_llm_weight(model_name.clone(), chunks),
-                "tokenizer" => extend_llm_tokenizer(model_name.clone(), chunks),
-                _ => return Err("Data type is not set".to_string()),
-            };
-            chunks = match extend_result {
-                Ok(chunks) => chunks,
-                Err(err) => return Err(err),
-            };
-            ic_cdk::println!("extended chunks. chunk id: {:?}", chunk_id);
-        }
-    }
-
-    ic_cdk::println!(
-        "!!! updated. iim content. content_type {} !!!",
-        content_type.clone()
-    );
-
-    let (removed_content, result_vec) = remove_tmp_data(model_name.clone(), content_type.clone());
-    ic_cdk::println!(
-        "!!! removed tmp_data. {:?} result_vec: {:?}!!!",
-        removed_content,
-        result_vec
-    );
-
-    ic_cdk::println!("!!! finished. commit_batch !!!");
-
-    Ok(model_name + "_" + &content_type)
+    // ic_cdk::println!("model: {:?}", model);
+    // ic_cdk::api::print(format!("loaded the model"));
+    // let seed: u64 = 299792458;
+    // let logits_processor = LogitsProcessor::new(seed, None, None);
+    // ic_cdk::println!("loaded logits_processor.");
+    // let loaded_model = llm::Model {
+    //     model,
+    //     tokenizer,
+    //     logits_processor,
+    //     tokens: vec![],
+    //     repeat_penalty: 1.,
+    //     repeat_last_n: 64,
+    // };
+    // ic_cdk::println!("loaded_model: {:?}", loaded_model);
 }
 
 #[query]
-fn exist_llm(key: String) -> bool {
-    STATE.with(|s| s.borrow().stable_data.contains_key(&key))
+fn api_version() -> u16 {
+    1
 }
 
-#[query]
-fn exist_llm_content(model_name: String, content_type: String) -> bool {
-    let exist_llm = exist_llm(model_name.clone());
-    if !exist_llm {
-        return false;
-    };
-    STATE.with(|s| match content_type.as_str() {
-        "weight" => match s.borrow().stable_data.get(&model_name).unwrap().0.weight {
-            Some(_) => true,
-            None => false,
-        },
-        "tokenizer" => match s.borrow().stable_data.get(&model_name).unwrap().0.tokenizer {
-            Some(_) => true,
-            None => false,
-        },
-        _ => false,
+#[update(guard = "is_manager_or_controller")]
+fn authorize(other: Principal) {
+    STATE.with(|s| s.borrow_mut().grant_permission(other, &Permission::Commit))
+}
+
+// #[update(guard = "is_manager_or_controller")]
+#[update] // TODO: uncomment the above line and remove this one once the finish development
+fn grant_permission(arg: GrantPermissionArguments) {
+    STATE.with(|s| {
+        s.borrow_mut()
+            .grant_permission(arg.to_principal, &arg.permission)
     })
 }
 
-// Retrieves the value associated with the given key in the stable data if it exists.
+#[update]
+async fn validate_grant_permission(arg: GrantPermissionArguments) -> Result<String, String> {
+    Ok(format!(
+        "grant {} permission to principal {}",
+        arg.permission, arg.to_principal
+    ))
+}
+
+#[update]
+async fn deauthorize(other: Principal) {
+    let check_access_result = if other == caller() {
+        // this isn't "ManagePermissions" because these legacy methods only
+        // deal with the Commit permission
+        has_permission_or_is_controller(&Permission::Commit)
+    } else {
+        is_controller()
+    };
+    match check_access_result {
+        Err(e) => trap(&e),
+        Ok(_) => STATE.with(|s| s.borrow_mut().revoke_permission(other, &Permission::Commit)),
+    }
+}
+
+#[update]
+async fn revoke_permission(arg: RevokePermissionArguments) {
+    let check_access_result = if arg.of_principal == caller() {
+        has_permission_or_is_controller(&arg.permission)
+    } else {
+        has_permission_or_is_controller(&Permission::ManagePermissions)
+    };
+    match check_access_result {
+        Err(e) => trap(&e),
+        Ok(_) => STATE.with(|s| {
+            s.borrow_mut()
+                .revoke_permission(arg.of_principal, &arg.permission)
+        }),
+    }
+}
+
+#[update]
+async fn validate_revoke_permission(arg: RevokePermissionArguments) -> Result<String, String> {
+    Ok(format!(
+        "revoke {} permission from principal {}",
+        arg.permission, arg.of_principal
+    ))
+}
+
+#[query(manual_reply = true)]
+fn list_authorized() -> ManualReply<Vec<Principal>> {
+    STATE.with(|s| ManualReply::one(s.borrow().list_permitted(&Permission::Commit)))
+}
+
+#[query(manual_reply = true)]
+fn list_permitted(arg: ListPermittedArguments) -> ManualReply<Vec<Principal>> {
+    STATE.with(|s| ManualReply::one(s.borrow().list_permitted(&arg.permission)))
+}
+
+#[update(guard = "is_controller")]
+async fn take_ownership() {
+    let caller = ic_cdk::api::caller();
+    STATE.with(|s| s.borrow_mut().take_ownership(caller))
+}
+
+#[update]
+async fn validate_take_ownership() -> Result<String, String> {
+    Ok("revoke all permissions, then gives the caller Commit permissions".to_string())
+}
+
 #[query]
-fn get_llm_keys() -> Vec<String> {
+fn retrieve(key: AssetKey) -> RcBytes {
+    STATE.with(|s| match s.borrow().retrieve(&key) {
+        Ok(bytes) => bytes,
+        Err(msg) => trap(&msg),
+    })
+}
+
+#[update(guard = "can_commit")]
+fn store(arg: StoreArg) {
+    STATE.with(move |s| {
+        if let Err(msg) = s.borrow_mut().store(arg, time()) {
+            trap(&msg);
+        }
+        set_certified_data(&s.borrow().root_hash());
+    });
+}
+
+#[update(guard = "can_prepare")]
+fn create_batch() -> CreateBatchResponse {
+    STATE.with(|s| match s.borrow_mut().create_batch(time()) {
+        Ok(batch_id) => CreateBatchResponse { batch_id },
+        Err(msg) => trap(&msg),
+    })
+}
+
+#[update(guard = "can_prepare")]
+fn create_chunk(arg: CreateChunkArg) -> CreateChunkResponse {
+    STATE.with(|s| match s.borrow_mut().create_chunk(arg, time()) {
+        Ok(chunk_id) => CreateChunkResponse { chunk_id },
+        Err(msg) => trap(&msg),
+    })
+}
+
+#[update(guard = "can_commit")]
+fn create_asset(arg: CreateAssetArguments) {
+    STATE.with(|s| {
+        if let Err(msg) = s.borrow_mut().create_asset(arg) {
+            trap(&msg);
+        }
+        set_certified_data(&s.borrow().root_hash());
+    })
+}
+
+#[update(guard = "can_commit")]
+fn set_asset_content(arg: SetAssetContentArguments) {
+    STATE.with(|s| {
+        if let Err(msg) = s.borrow_mut().set_asset_content(arg, time()) {
+            trap(&msg);
+        }
+        set_certified_data(&s.borrow().root_hash());
+    })
+}
+
+#[update(guard = "can_commit")]
+fn unset_asset_content(arg: UnsetAssetContentArguments) {
+    STATE.with(|s| {
+        if let Err(msg) = s.borrow_mut().unset_asset_content(arg) {
+            trap(&msg);
+        }
+        set_certified_data(&s.borrow().root_hash());
+    })
+}
+
+#[update(guard = "can_commit")]
+fn delete_asset(arg: DeleteAssetArguments) {
+    STATE.with(|s| {
+        s.borrow_mut().delete_asset(arg);
+        set_certified_data(&s.borrow().root_hash());
+    });
+}
+
+#[update(guard = "can_commit")]
+fn clear() {
+    STATE.with(|s| {
+        s.borrow_mut().clear();
+        set_certified_data(&s.borrow().root_hash());
+    });
+}
+
+#[update(guard = "can_commit")]
+fn commit_batch(arg: CommitBatchArguments) {
+    STATE.with(|s| {
+        if let Err(msg) = s.borrow_mut().commit_batch(arg, time()) {
+            trap(&msg);
+        }
+        set_certified_data(&s.borrow().root_hash());
+    });
+}
+
+#[update(guard = "can_prepare")]
+fn propose_commit_batch(arg: CommitBatchArguments) {
+    STATE.with(|s| {
+        if let Err(msg) = s.borrow_mut().propose_commit_batch(arg) {
+            trap(&msg);
+        }
+    });
+}
+
+#[update(guard = "can_prepare")]
+fn compute_evidence(arg: ComputeEvidenceArguments) -> Option<ByteBuf> {
+    STATE.with(|s| match s.borrow_mut().compute_evidence(arg) {
+        Err(msg) => trap(&msg),
+        Ok(maybe_evidence) => maybe_evidence,
+    })
+}
+
+#[update(guard = "can_commit")]
+fn commit_proposed_batch(arg: CommitProposedBatchArguments) {
+    STATE.with(|s| {
+        if let Err(msg) = s.borrow_mut().commit_proposed_batch(arg, time()) {
+            trap(&msg);
+        }
+        set_certified_data(&s.borrow().root_hash());
+    });
+}
+
+#[update]
+fn validate_commit_proposed_batch(arg: CommitProposedBatchArguments) -> Result<String, String> {
+    STATE.with(|s| s.borrow_mut().validate_commit_proposed_batch(arg))
+}
+
+#[update(guard = "can_prepare")]
+fn delete_batch(arg: DeleteBatchArguments) {
+    STATE.with(|s| {
+        if let Err(msg) = s.borrow_mut().delete_batch(arg) {
+            trap(&msg);
+        }
+    });
+}
+
+#[query]
+fn get(arg: GetArg) -> EncodedAsset {
+    STATE.with(|s| match s.borrow().get(arg) {
+        Ok(asset) => asset,
+        Err(msg) => trap(&msg),
+    })
+}
+
+#[query]
+fn get_chunk(arg: GetChunkArg) -> GetChunkResponse {
+    STATE.with(|s| match s.borrow().get_chunk(arg) {
+        Ok(content) => GetChunkResponse { content },
+        Err(msg) => trap(&msg),
+    })
+}
+
+#[query]
+fn list() -> Vec<AssetDetails> {
+    STATE.with(|s| s.borrow().list_assets())
+}
+
+#[query]
+fn certified_tree() -> CertifiedTree {
+    let certificate = data_certificate().unwrap_or_else(|| trap("no data certificate available"));
+
+    STATE.with(|s| s.borrow().certified_tree(&certificate))
+}
+
+#[query]
+fn http_request(req: HttpRequest) -> HttpResponse {
+    let certificate = data_certificate().unwrap_or_else(|| trap("no data certificate available"));
+
+    STATE.with(|s| {
+        s.borrow().http_request(
+            req,
+            &certificate,
+            CallbackFunc::new(ic_cdk::id(), "http_request_streaming_callback".to_string()),
+        )
+    })
+}
+
+#[query]
+fn http_request_streaming_callback(token: StreamingCallbackToken) -> StreamingCallbackHttpResponse {
     STATE.with(|s| {
         s.borrow()
-            .stable_data
-            .iter()
-            .map(|(k, _)| k.clone())
-            .collect()
+            .http_request_streaming_callback(token)
+            .unwrap_or_else(|msg| trap(&msg))
     })
 }
 
-// Inserts an entry into the map and returns the previous value of the key from stable data
-// if it exists.
-#[update]
-fn insert_llm(key: String, value: StableBTreeMapLLM) -> Option<String> {
-    STATE.with(|s| s.borrow_mut().stable_data.insert(key.clone(), value));
-    Some(key)
-}
-
-#[update]
-fn update_llm_config(key: String, config: ConfigData) -> Option<String> {
-    let llm_result = STATE.with(|s| s.borrow().stable_data.get(&key));
-    let mut llm = match llm_result {
-        Some(llm) => llm,
-        None => return None,
-    };
-    llm = StableBTreeMapLLM(LLM {
-        model_name: llm.0.model_name.clone(),
-        weight: llm.0.weight.clone(),
-        tokenizer: llm.0.tokenizer.clone(),
-        config: Some(config),
-    });
-    STATE.with(|s| s.borrow_mut().stable_data.insert(key.clone(), llm));
-    Some(key)
-}
-
-#[update]
-fn update_llm_weight(key: String, weight: Option<Vec<u8>>) -> Option<String> {
-    let llm_result = STATE.with(|s| s.borrow().stable_data.get(&key));
-    let mut llm = match llm_result {
-        Some(llm) => llm,
-        None => return None,
-    };
-    llm = StableBTreeMapLLM(LLM {
-        model_name: llm.0.model_name.clone(),
-        weight: weight,
-        tokenizer: llm.0.tokenizer.clone(),
-        config: llm.0.config.clone(),
-    });
-    STATE.with(|s| s.borrow_mut().stable_data.insert(key.clone(), llm));
-    Some(key)
-}
-
-#[update]
-fn update_llm_tokenizer(key: String, tokenizer: Option<Vec<u8>>) -> Option<String> {
-    let llm_result = STATE.with(|s| s.borrow().stable_data.get(&key));
-    let mut llm = match llm_result {
-        Some(llm) => llm,
-        None => return None,
-    };
-    llm = StableBTreeMapLLM(LLM {
-        model_name: llm.0.model_name.clone(),
-        weight: llm.0.weight.clone(),
-        tokenizer: tokenizer,
-        config: llm.0.config.clone(),
-    });
-    STATE.with(|s| s.borrow_mut().stable_data.insert(key.clone(), llm));
-    Some(key)
-}
-
-#[update]
-fn extend_llm_weight(key: String, mut chunks: Vec<u8>) -> Result<Vec<u8>, String> {
-    ic_cdk::println!("start extend_llm_weight.");
-    let exist_llm = STATE.with(|s| s.borrow().stable_data.contains_key(&key));
-    if !exist_llm {
-        return Err("llm Not Found.".to_string());
-    };
-
-    ic_cdk::println!("exist_llm: {:?}", exist_llm);
-    let option_weight = STATE.with(|s| s.borrow().stable_data.get(&key).unwrap().0.weight);
-    ic_cdk::println!("option_weight.is_none(): {:?}", option_weight.is_none());
-    match option_weight {
-        Some(mut weight) => {
-            ic_cdk::println!("option_weight is some.");
-            weight.extend(chunks);
-            ic_cdk::println!("extended weight.len(): {:?}", weight.len());
-            STATE.with(|s| {
-                let llm = s.borrow_mut().stable_data.get(&key).unwrap().0;
-                STATE.with(|s| {
-                    s.borrow_mut().stable_data.insert(
-                        key.clone(),
-                        StableBTreeMapLLM(LLM {
-                            model_name: llm.model_name,
-                            weight: Some(weight),
-                            tokenizer: llm.tokenizer,
-                            config: llm.config,
-                        }),
-                    )
-                });
-            });
-            ic_cdk::println!("saved extended weight!!!");
-        }
-        None => return Err("weight Not Found.".to_string()),
-    };
-    chunks = vec![];
-    Ok(chunks)
-}
-
-#[update]
-fn extend_llm_tokenizer(key: String, mut chunks: Vec<u8>) -> Result<Vec<u8>, String> {
-    let exist_llm = STATE.with(|s| s.borrow().stable_data.contains_key(&key));
-    if !exist_llm {
-        return Err("llm Not Found.".to_string());
-    };
-    let option_tokenizer = STATE.with(|s| s.borrow().stable_data.get(&key).unwrap().0.tokenizer);
-    match option_tokenizer {
-        Some(mut tokenizer) => {
-            tokenizer.extend(chunks);
-            STATE.with(|s| {
-                let llm = s.borrow_mut().stable_data.get(&key).unwrap().0;
-                STATE.with(|s| {
-                    s.borrow_mut().stable_data.insert(
-                        key.clone(),
-                        StableBTreeMapLLM(LLM {
-                            model_name: llm.model_name,
-                            weight: llm.weight,
-                            tokenizer: Some(tokenizer),
-                            config: llm.config,
-                        }),
-                    )
-                });
-            });
-        }
-        None => return Err("tokenizer Not Found.".to_string()),
-    };
-    chunks = vec![];
-    Ok(chunks)
-}
-
 #[query]
-fn get_llm_ditaile(
-    key: String,
-) -> Option<(String, Option<usize>, Option<usize>, Option<ConfigData>)> {
-    let llm_result = STATE.with(|s| s.borrow().stable_data.get(&key));
-    match llm_result {
-        Some(llm) => {
-            let weight_len = match &llm.0.weight {
-                Some(weight) => {
-                    ic_cdk::api::print(format!("weight: {:?}", weight));
-                    Some(weight.len())
-                }
-                None => None,
-            };
-            let tokenizer_len = match &llm.0.tokenizer {
-                Some(tokenizer) => {
-                    ic_cdk::api::print(format!("tokenizer: {:?}", tokenizer));
-                    Some(tokenizer.len())
-                }
-                None => None,
-            };
+fn get_asset_properties(key: AssetKey) -> AssetProperties {
+    STATE.with(|s| {
+        s.borrow()
+            .get_asset_properties(key)
+            .unwrap_or_else(|msg| trap(&msg))
+    })
+}
 
-            ic_cdk::api::print(format!("model_name: {:?}", llm.0.model_name));
-            ic_cdk::api::print(format!("weight_len: {:?}", weight_len));
-            ic_cdk::api::print(format!("tokenizer_len: {:?}", tokenizer_len));
-            ic_cdk::api::print(format!("config: {:?}", llm.0.config));
-
-            Some((llm.0.model_name, weight_len, tokenizer_len, llm.0.config))
+#[update(guard = "can_commit")]
+fn set_asset_properties(arg: SetAssetPropertiesArguments) {
+    STATE.with(|s| {
+        if let Err(msg) = s.borrow_mut().set_asset_properties(arg) {
+            trap(&msg);
         }
-        None => None,
+    })
+}
+
+#[update(guard = "can_prepare")]
+fn get_configuration() -> ConfigurationResponse {
+    STATE.with(|s| s.borrow().get_configuration())
+}
+
+#[update(guard = "can_commit")]
+fn configure(arg: ConfigureArguments) {
+    STATE.with(|s| s.borrow_mut().configure(arg))
+}
+
+#[update]
+fn validate_configure(arg: ConfigureArguments) -> Result<String, String> {
+    Ok(format!("configure: {:?}", arg))
+}
+
+fn can(permission: Permission) -> Result<(), String> {
+    STATE.with(|s| {
+        s.borrow()
+            .can(&caller(), &permission)
+            .then_some(())
+            .ok_or_else(|| format!("Caller does not have {} permission", permission))
+    })
+}
+
+fn can_commit() -> Result<(), String> {
+    can(Permission::Commit)
+}
+
+fn can_prepare() -> Result<(), String> {
+    can(Permission::Prepare)
+}
+
+fn has_permission_or_is_controller(permission: &Permission) -> Result<(), String> {
+    let caller = caller();
+    let has_permission = STATE.with(|s| s.borrow().has_permission(&caller, permission));
+    let is_controller = ic_cdk::api::is_controller(&caller);
+    if has_permission || is_controller {
+        Ok(())
+    } else {
+        Err(format!(
+            "Caller does not have {} permission and is not a controller.",
+            permission
+        ))
     }
 }
 
-fn remove_tmp_content(count_pat: CountPat, model_name: String, content_type: String) -> bool {
-    match count_pat {
-        CountPat::Pat0 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data0
-                .remove(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat1 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data1
-                .remove(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat2 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data2
-                .remove(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat3 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data3
-                .remove(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat4 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data4
-                .remove(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat5 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data5
-                .remove(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat6 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data6
-                .remove(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat7 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data7
-                .remove(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat8 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data8
-                .remove(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-        CountPat::Pat9 => STATE.with(|s| {
-            s.borrow_mut()
-                .tmp_data9
-                .remove(&(model_name.clone() + "_" + &content_type.clone()))
-        }),
-    };
-    true
+fn is_manager_or_controller() -> Result<(), String> {
+    has_permission_or_is_controller(&Permission::ManagePermissions)
 }
 
-#[update]
-pub fn remove_tmp_data(model_name: String, content_type: String) -> (String, Vec<bool>) {
-    let mut result = vec![];
-    for i in 0..MAX_COUNT_PAT {
-        let count_pat = get_count_pat(i);
-        let exist_tmp_data =
-            exist_tmp_data(count_pat.clone(), model_name.clone(), content_type.clone());
-        if !exist_tmp_data {
-            result.push(false);
-            continue;
-        }
-        result.push(remove_tmp_content(
-            count_pat.clone(),
-            model_name.clone(),
-            content_type.clone(),
-        ));
+fn is_controller() -> Result<(), String> {
+    let caller = caller();
+    if ic_cdk::api::is_controller(&caller) {
+        Ok(())
+    } else {
+        Err("Caller is not a controller.".to_string())
     }
-    (
-        format!(
-            "model_name: {:?}, content_type: {:?}",
-            model_name, content_type
-        ),
-        result,
-    )
 }
 
-// Sets the data that lives on the heap.
-#[update]
-fn set_heap_data(data: Vec<u8>) {
-    STATE.with(|s| s.borrow_mut().data_on_the_heap = data);
+#[init]
+fn init() {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.clear();
+        s.grant_permission(caller(), &Permission::Commit);
+    });
 }
 
-// Retrieves the data that lives on the heap.
-#[query]
-fn get_heap_data() -> Vec<u8> {
-    STATE.with(|s| s.borrow().data_on_the_heap.clone())
-}
-
-// A pre-upgrade hook for serializing the data stored on the heap.
 #[pre_upgrade]
 fn pre_upgrade() {
-    // Serialize the state.
-    // This example is using CBOR, but you can use any data format you like.
-    let mut state_bytes = vec![];
-    STATE
-        .with(|s| ciborium::ser::into_writer(&*s.borrow(), &mut state_bytes))
-        .expect("failed to encode state");
-
-    // Write the length of the serialized bytes to memory, followed by the
-    // by the bytes themselves.
-    let len = state_bytes.len() as u32;
-    let mut memory = memory::get_upgrades_memory();
-    let mut writer = Writer::new(&mut memory, 0);
-    writer.write(&len.to_le_bytes()).unwrap();
-    writer.write(&state_bytes).unwrap()
+    let stable_state: StableState = STATE.with(|s| s.take().into());
+    ic_cdk::storage::stable_save((stable_state,)).expect("failed to save stable state");
 }
 
-// A post-upgrade hook for deserializing the data back into the heap.
 #[post_upgrade]
 fn post_upgrade() {
-    let memory = memory::get_upgrades_memory();
-
-    // Read the length of the state bytes.
-    let mut state_len_bytes = [0; 4];
-    memory.read(0, &mut state_len_bytes);
-    let state_len = u32::from_le_bytes(state_len_bytes) as usize;
-
-    // Read the bytes
-    let mut state_bytes = vec![0; state_len];
-    memory.read(4, &mut state_bytes);
-
-    // Deserialize and set the state.
-    let state = ciborium::de::from_reader(&*state_bytes).expect("failed to decode state");
-    STATE.with(|s| *s.borrow_mut() = state);
-}
-
-fn init_stable_data() -> StableBTreeMap<String, StableBTreeMapLLM, Memory> {
-    StableBTreeMap::init(crate::memory::get_stable_btree_memory())
-}
-
-#[query]
-fn greet(name: String) -> String {
-    format!("Hello, {}!", name)
+    let (stable_state,): (StableState,) =
+        ic_cdk::storage::stable_restore().expect("failed to restore stable state");
+    STATE.with(|s| {
+        *s.borrow_mut() = State::from(stable_state);
+        set_certified_data(&s.borrow().root_hash());
+    });
 }
 
 export_candid!();

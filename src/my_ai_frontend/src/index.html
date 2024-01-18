@@ -15,24 +15,86 @@
     <img src="logo2.svg" alt="DFINITY logo" />
     <br />
     <br />
-    <form action="#">
-      <label for="name">Enter your name: &nbsp;</label>
-      <input id="name" alt="Name" type="text" />
-      <button type="submit">Click Me!</button>
-    </form>
-    <section id="greeting"></section>
+
+    <div>
+      <h1>Identity</h1>
+      <h2>Sign In</h2>
+      <div>
+        <label for="idpUrl" style="display: inline-block; width: 120px">Identity Provider: </label>
+        <input type="text" id="idpUrl" value="https://identity.ic0.app/#authorize" />
+      </div>
+      <button id="signinBtn">Sign In</button>
+      <button id="signoutBtn">Sign Out</button>
+      <h2>Principal:</h2>
+      <div id="principal"></div>
+      <select name="permission" id="permission">
+        <option value="">--Please choose an permission--</option>
+        <option value="Prepare">Prepare</option>
+        <option value="ManagePermissions">ManagePermissions</option>
+        <option value="Commit">Commit</option>
+      </select>
+      <button id="grantPermission">Grant Permission</button>
+    </div>
+    <div>
+
+    </div>
+    <div>
+      <h1>Contact the IC</h1>
+      <label for="hostUrl" style="display: inline-block; width: 120px">Replica URL: </label>
+      <input type="text" id="hostUrl" value="127.0.0.1:8000/?canisterId=be2us-64aaa-aaaaa-qaabq-cai" />
+      <!-- <input type="text" id="hostUrl" value="https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io/" /> -->
+      <br />
+      <label for="canisterId" style="display: inline-block; width: 120px">Canister ID: </label>
+      <input type="text" id="canisterId" value="3z2ve-waaaa-aaaab-qacmq-cai" />
+    </div>
 
     <section id="model">
-      <label for="model">Puffin-Phi-v2:</label>
-      <input id="model" alt="Model" type="text" />
-      <img id="file-preview">
+      <label for="model">Set Model Content:</label>
+      <input id="setModelContent" alt="Model" type="text" />
+      <button id="setModelContent">Set Model Content</button>
     </section>
     <section id="file">
       <label for="file">File:</label>
-      <input id="file" alt="File" type="file" accept=".json,.safetensors" />
+      <input id="file" alt="File" type="file" accept=".json,.safetensors,.gguf" />
       <button class="upload">Upload</button>
+      <p id="uploadResult"></p>
+      <progress id="fileUploadProgress" max="100" value="0" hidden></progress>
     </section>
     <section></section>
+    <section id="loadConfig">
+      <label for="loadConfig">Config Path:</label>
+      <input id="loadConfig" alt="configPath" type="text" />
+      <button id="loadConfig">Load Config</button>
+    </section>
+    <section id="loadTokenizer">
+      <label for="loadTokenizer">Tokenizer Path:</label>
+      <input id="loadTokenizer" alt="TokenizerPath" type="text" />
+      <button id="loadTokenizer">Load Tokenizer</button>
+    </section>
+    <section id="loadModel">
+      <label for="loadModel">Model Path:</label>
+      <input id="loadModel" alt="ModelPath" type="text" />
+      <button id="loadModel">Load Model</button>
+    </section>
+    <section id="loadGGUF">
+      <label for="loadGGUF">GGUF Path:</label>
+      <input id="loadGGUF" alt="GGUFPath" type="text" />
+      <button id="loadGGUF">Load GGUF</button>
+    </section>
+    <section id="getAsset">
+      <label for="getAsset">Asset Path:</label>
+      <input id="getAsset" alt="AssetPath" type="text" />
+      <button id="getAsset">Get Asset</button>
+    </section>
+    <section id="clear">
+      <button id="clear">Clear All Data</button>
+    </section>
+    <section id="getAssetsList">
+      <button id="getAssetsList">Get Assets List</button>
+    </section>
+    <section id="assetsList">
+      <pre></pre>
+    </section>
   </main>
 </body>
 

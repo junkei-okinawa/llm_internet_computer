@@ -3,26 +3,11 @@
     "my_ai_backend": {
       "candid": "src/my_ai_backend/my_ai_backend.did",
       "package": "my_ai_backend",
-      "type": "rust",
-      "optimize": "cycles",
-      "gzip": true
-    },
-    "internet_identity": {
-      "type": "custom",
-      "candid": "https://github.com/dfinity/internet-identity/releases/latest/download/internet_identity.did",
-      "wasm": "https://github.com/dfinity/internet-identity/releases/latest/download/internet_identity_dev.wasm.gz",
-      "shrink": false,
-      "remote": {
-        "candid": "internet_identity.did",
-        "id": {
-          "ic": "rdmx6-jaaaa-aaaaa-aaadq-cai"
-        }
-      }
+      "type": "rust"
     },
     "my_ai_frontend": {
       "dependencies": [
-        "my_ai_backend",
-        "internet_identity"
+        "my_ai_backend"
       ],
       "frontend": {
         "entrypoint": "src/my_ai_frontend/src/index.html"

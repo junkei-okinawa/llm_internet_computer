@@ -11,7 +11,7 @@ function generate_did() {
 }
 
 # The list of canisters of your project
-CANISTERS=my_ai_backend
+CANISTERS=(my_ai_backend)
 
 for canister in $(echo $CANISTERS | sed "s/,/ /g")
 do

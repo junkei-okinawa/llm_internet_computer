@@ -3,9 +3,7 @@
     "my_ai_backend": {
       "candid": "src/my_ai_backend/my_ai_backend.did",
       "package": "my_ai_backend",
-      "type": "rust",
-      "optimize": "cycles",
-      "gzip": true
+      "type": "rust"
     },
     "internet_identity": {
       "type": "custom",

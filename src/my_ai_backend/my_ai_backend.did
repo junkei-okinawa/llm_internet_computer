@@ -1,43 +1,191 @@
-type ConfigData = record {
-  vocab_size : nat64;
-  rotary_dim : nat64;
-  n_layer : nat64;
-  layer_norm_epsilon : text;
-  tie_word_embeddings : bool;
-  pad_vocab_size_multiple : nat64;
-  n_positions : nat64;
-  n_inner : opt nat64;
-  activation_function : text;
-  n_embd : nat64;
-  n_head : nat64;
+type AssetDetails = record {
+  key : text;
+  encodings : vec AssetEncodingDetails;
+  content_type : text;
 };
-type LLM = record {
-  weight : opt vec nat8;
-  model_name : text;
-  tokenizer : opt vec nat8;
-  config : opt ConfigData;
+type AssetEncodingDetails = record {
+  modified : int;
+  sha256 : opt vec nat8;
+  length : nat;
+  content_encoding : text;
 };
-type Result = variant { Ok : text; Err : text };
-type Result_1 = variant { Ok : nat32; Err : text };
-type Result_2 = variant { Ok : vec nat8; Err : text };
-service : {
-  commit_batch : (text, text, vec nat32) -> (Result);
-  create_chunk : (text, text, vec nat8, nat32) -> (Result_1);
-  exist_llm : (text) -> (bool) query;
-  exist_llm_content : (text, text) -> (bool) query;
-  extend_llm_tokenizer : (text, vec nat8) -> (Result_2);
-  extend_llm_weight : (text, vec nat8) -> (Result_2);
-  get_heap_data : () -> (vec nat8) query;
-  get_llm_ditaile : (text) -> (
-      opt record { text; opt nat64; opt nat64; opt ConfigData },
+type AssetProperties = record {
+  headers : opt vec record { text; text };
+  is_aliased : opt bool;
+  allow_raw_access : opt bool;
+  max_age : opt nat64;
+};
+type BatchOperation = variant {
+  SetAssetProperties : SetAssetPropertiesArguments;
+  CreateAsset : CreateAssetArguments;
+  UnsetAssetContent : UnsetAssetContentArguments;
+  DeleteAsset : DeleteAssetArguments;
+  SetAssetContent : SetAssetContentArguments;
+  Clear : record {};
+};
+type CertifiedTree = record { certificate : vec nat8; tree : vec nat8 };
+type CommitBatchArguments = record {
+  batch_id : nat;
+  operations : vec BatchOperation;
+};
+type CommitProposedBatchArguments = record {
+  batch_id : nat;
+  evidence : vec nat8;
+};
+type ComputeEvidenceArguments = record {
+  batch_id : nat;
+  max_iterations : opt nat16;
+};
+type ConfigurationResponse = record {
+  max_batches : opt nat64;
+  max_bytes : opt nat64;
+  max_chunks : opt nat64;
+};
+type ConfigureArguments = record {
+  max_batches : opt opt nat64;
+  max_bytes : opt opt nat64;
+  max_chunks : opt opt nat64;
+};
+type CreateAssetArguments = record {
+  key : text;
+  content_type : text;
+  headers : opt vec record { text; text };
+  allow_raw_access : opt bool;
+  max_age : opt nat64;
+  enable_aliasing : opt bool;
+};
+type CreateBatchResponse = record { batch_id : nat };
+type CreateChunkArg = record { content : vec nat8; batch_id : nat };
+type CreateChunkResponse = record { chunk_id : nat };
+type DeleteAssetArguments = record { key : text };
+type EncodedAsset = record {
+  content : vec nat8;
+  sha256 : opt vec nat8;
+  content_type : text;
+  content_encoding : text;
+  total_length : nat;
+};
+type GetArg = record { key : text; accept_encodings : vec text };
+type GetChunkArg = record {
+  key : text;
+  sha256 : opt vec nat8;
+  index : nat;
+  content_encoding : text;
+};
+type GetChunkResponse = record { content : vec nat8 };
+type GrantPermissionArguments = record {
+  permission : Permission;
+  to_principal : principal;
+};
+type HttpRequest = record {
+  url : text;
+  method : text;
+  body : vec nat8;
+  headers : vec record { text; text };
+  certificate_version : opt nat16;
+};
+type HttpResponse = record {
+  body : vec nat8;
+  headers : vec record { text; text };
+  upgrade : opt bool;
+  streaming_strategy : opt StreamingStrategy;
+  status_code : nat16;
+};
+type ListPermittedArguments = record { permission : Permission };
+type Permission = variant { Prepare; ManagePermissions; Commit };
+type Result = variant { Ok : SetModelContentResponse; Err : text };
+type Result_1 = variant { Ok : text; Err : text };
+type RevokePermissionArguments = record {
+  permission : Permission;
+  of_principal : principal;
+};
+type SetAssetContentArguments = record {
+  key : text;
+  sha256 : opt vec nat8;
+  chunk_ids : vec nat;
+  content_encoding : text;
+};
+type SetAssetPropertiesArguments = record {
+  key : text;
+  headers : opt opt vec record { text; text };
+  is_aliased : opt opt bool;
+  allow_raw_access : opt opt bool;
+  max_age : opt opt nat64;
+};
+type SetModelContentArguments = record {
+  key : text;
+  now : nat64;
+  set_content_count : nat64;
+  content_encoding : text;
+};
+type SetModelContentResponse = record {
+  total_chunks_length : nat32;
+  current_chunks_length : nat32;
+};
+type StoreArg = record {
+  key : text;
+  content : vec nat8;
+  sha256 : opt vec nat8;
+  content_type : text;
+  aliased : opt bool;
+  content_encoding : text;
+};
+type StreamingCallbackHttpResponse = record {
+  token : opt GetChunkArg;
+  body : vec nat8;
+};
+type StreamingStrategy = variant {
+  Callback : record {
+    token : GetChunkArg;
+    callback : func (GetChunkArg) -> (StreamingCallbackHttpResponse) query;
+  };
+};
+type UnsetAssetContentArguments = record {
+  key : text;
+  content_encoding : text;
+};
+service : () -> {
+  api_version : () -> (nat16) query;
+  authorize : (principal) -> ();
+  certified_tree : () -> (CertifiedTree) query;
+  clear : () -> ();
+  commit_batch : (CommitBatchArguments) -> ();
+  commit_proposed_batch : (CommitProposedBatchArguments) -> ();
+  compute_evidence : (ComputeEvidenceArguments) -> (opt vec nat8);
+  configure : (ConfigureArguments) -> ();
+  create_asset : (CreateAssetArguments) -> ();
+  create_batch : () -> (CreateBatchResponse);
+  create_chunk : (CreateChunkArg) -> (CreateChunkResponse);
+  deauthorize : (principal) -> ();
+  delete_asset : (DeleteAssetArguments) -> ();
+  delete_batch : (CreateBatchResponse) -> ();
+  get : (GetArg) -> (EncodedAsset) query;
+  get_asset_properties : (text) -> (AssetProperties) query;
+  get_chunk : (GetChunkArg) -> (GetChunkResponse) query;
+  get_configuration : () -> (ConfigurationResponse);
+  grant_permission : (GrantPermissionArguments) -> ();
+  http_request : (HttpRequest) -> (HttpResponse) query;
+  http_request_streaming_callback : (GetChunkArg) -> (
+      StreamingCallbackHttpResponse,
     ) query;
-  get_llm_keys : () -> (vec text) query;
-  greet : (text) -> (text) query;
-  init_llm_config : (text, ConfigData) -> (opt text);
-  insert_llm : (text, LLM) -> (opt text);
-  remove_tmp_data : (text, text) -> (text, vec bool);
-  set_heap_data : (vec nat8) -> ();
-  update_llm_config : (text, ConfigData) -> (opt text);
-  update_llm_tokenizer : (text, opt vec nat8) -> (opt text);
-  update_llm_weight : (text, opt vec nat8) -> (opt text);
+  list : () -> (vec AssetDetails) query;
+  list_authorized : () -> (vec principal) query;
+  list_permitted : (ListPermittedArguments) -> (vec principal) query;
+  load_config : (GetArg) -> ();
+  load_gguf : (GetArg) -> ();
+  load_tokenizer : (GetArg) -> ();
+  propose_commit_batch : (CommitBatchArguments) -> ();
+  retrieve : (text) -> (vec nat8) query;
+  revoke_permission : (RevokePermissionArguments) -> ();
+  set_asset_content : (SetAssetContentArguments) -> ();
+  set_asset_properties : (SetAssetPropertiesArguments) -> ();
+  set_model_content : (SetModelContentArguments) -> (Result);
+  store : (StoreArg) -> ();
+  take_ownership : () -> ();
+  unset_asset_content : (UnsetAssetContentArguments) -> ();
+  validate_commit_proposed_batch : (CommitProposedBatchArguments) -> (Result_1);
+  validate_configure : (ConfigureArguments) -> (Result_1);
+  validate_grant_permission : (GrantPermissionArguments) -> (Result_1);
+  validate_revoke_permission : (RevokePermissionArguments) -> (Result_1);
+  validate_take_ownership : () -> (Result_1);
 }
